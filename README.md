@@ -58,7 +58,7 @@ XDRIVE - A transport layer that uses cloud storage services as a communication c
 
 ## Context and Goals
 
-XDRIVE allows two nodes to communicate through files stored in a cloud storage service (Google Drive, S3, WebDAV, FTP, Local FS). This provides two properties that classical transports cannot achieve:
+XDRIVE allows two nodes to communicate through files stored in a cloud storage service (Google Drive, S3, WebDAV, FTP, Local FS). This provides three properties that classical transports cannot achieve:
 
 - No public IP: the server can sit behind NAT or on a home network.
 - No direct TCP connection: the censor sees only HTTPS traffic to the cloud storage domain.
@@ -221,7 +221,7 @@ type DriveService interface {
 |Google Drive|fileId from cache + search inside folder        |DELETE session folder                   |
 |Local FS    |`filepath.Join(folder, session, direction, seq)`|`os.RemoveAll`                          |
 
-**S3 CleanupSession** is a composite non-transactional operation. It is called only after two-sided close (both FINs received or idleTimeout elapsed). Repeat `ListPrefix` after each `BatchDeleteObjects` until `count == 0`, maximum 5 iterations with a 5s pause. S3 Object Expiration Rules serve as a safety net.
+**S3 CleanupSession** is a composite non-transactional operation. It is called only after two-sided close (both FINs received or idleTimeout elapsed). Repeat `ListPrefix` after each `BatchDeleteObjects` until `count == 0`, maximum 5 iterations with a 5s pause. S3 Object Expiration Rules serve as a safety net. **This cleanup is best-effort, not guaranteed**: some S3-compatible implementations (notably MinIO under concurrent load) may return already-deleted keys in a subsequent ListPrefix due to internal replication lag. The 5-iteration limit prevents infinite loops; any residual objects will be collected by Object Expiration or the next Startup/Periodic GC.
 
 -----
 
@@ -299,6 +299,9 @@ secretSeed  ← int64(binary.BigEndian.Uint64(HMAC-SHA256(sharedSecret, []byte("
 writerRng   ← rand.New(rand.NewSource(
     time.Now().UnixNano() ^ int64(os.Getpid()) ^ sessionSeed ^ secretSeed))
 
+// Client: writeSeq starts at 1 (c2s/0 was sent inside the discovery file).
+// Server: writeSeq starts at 0 (s2c/0 is the first regular upload).
+writeSeq    ← 1  // client side; server side initializes to 0
 inflight    ← []byte(nil)   // data for the current in-flight Upload
 inflightSeq ← uint64(0)
 
@@ -355,15 +358,17 @@ loop:
 
 ### Graceful Close (FIN)
 
-FIN carries `lastDataSeq` - the sequence number of the last successfully uploaded data packet:
+FIN payload encodes `writeSeq` - the total number of confirmed data uploads at the time FIN is sent. This is the value of `writeSeq` after all data uploads are confirmed and before the FIN upload itself. FIN does not increment `writeSeq`.
 
 ```
-finPayload = uint64_big_endian(writeSeq - 1)
+// writeSeq at this point = number of confirmed data packets
+finPayload = uint64_big_endian(writeSeq)
 finHmac    = HMAC-SHA256(fileKey(uint64_max), finPayload)[:16]
 service.Upload(bgCtx, FileRef{session, myDirection, uint64_max}, finPayload + finHmac)
+// writeSeq is NOT incremented after FIN upload
 ```
 
-If `writeSeq == 0` (no data was sent), `finPayload = uint64_max - 1` as a sentinel.
+Zero-data case: client `writeSeq=1` after discovery (c2s/0 sent), but then no further data was written before close. `finPayload=1`, OOO Reader closes when `readSeq >= 1`, i.e. after receiving exactly c2s/0 via `injectFirstPacket`. If the server sends no data at all: `writeSeq=0`, `finPayload=0`, OOO Reader closes immediately at `readSeq=0 >= 0`.
 
 -----
 
@@ -413,6 +418,8 @@ loop:
     if readSeq == uint64_max:  // FIN
         // Sequential Reader: if readSeq has reached FIN,
         // all preceding seq have already been processed by definition.
+        // FIN payload carries writeSeq (packet count) for consistency with OOO Reader,
+        // but Sequential Reader does not need it - ordering is guaranteed.
         initiate graceful close
         return
 
@@ -430,18 +437,32 @@ loop:
 
 ```
 outOfOrderBuf   ← map[uint64]chunkData
-expectedLastSeq ← uint64_max  // unknown until FIN is received
-finReceived     ← false
-maxLookahead    ← 8
+expectedPktCount ← uint64_max  // unknown until FIN is received
+finReceived      ← false
+maxLookahead     ← 8
+ooProbe          ← make(chan struct{}, maxLookahead+1)  // semaphore: max concurrent probeOOO
 
 loop:
     // Probe window [readSeq .. readSeq+maxLookahead]
     for seq in window not in outOfOrderBuf:
-        go probeOOO(seq, context.WithTimeout(readerCtx, 3s))
+        select {
+        case ooProbe <- struct{}{}:
+            go func(s uint64):
+                defer func() { <-ooProbe }()
+                probeOOO(s, context.WithTimeout(readerCtx, 3s))
+            (seq)
+        default:
+        }
 
     // Probe FIN in parallel
     if !finReceived:
-        go probeOOO(uint64_max, context.WithTimeout(readerCtx, 3s))
+        select {
+        case ooProbe <- struct{}{}:
+            go func():
+                defer func() { <-ooProbe }()
+                probeOOO(uint64_max, context.WithTimeout(readerCtx, 3s))
+        default:
+        }
 
     if outOfOrderBuf[readSeq] exists:
         send to readCh
@@ -450,8 +471,9 @@ loop:
         lastSuccessfulRead ← time.Now()
         continue
 
-    // FIN handling: wait for all packets up to expectedLastSeq
-    if finReceived && readSeq > expectedLastSeq:
+    // FIN handling: readSeq == expectedPktCount means all packets delivered
+    // (readSeq is the count of delivered packets, expectedPktCount is the total sent)
+    if finReceived && readSeq >= expectedPktCount:
         initiate graceful close
         return
 
@@ -464,9 +486,12 @@ loop:
 When FIN is received via `probeOOO(uint64_max)`:
 
 ```
-lastDataSeq     ← uint64_big_endian(data[0:8])
-expectedLastSeq ← lastDataSeq
-finReceived     ← true
+pktCount         ← uint64_big_endian(data[0:8])  // total packets sent by remote
+expectedPktCount ← pktCount
+finReceived      ← true
+// Example: remote sent 5 packets (seq 0..4), pktCount=5.
+// OOO Reader closes when readSeq >= 5, i.e. after all 5 are delivered.
+// Zero-data case: pktCount=0, readSeq=0 >= 0 -> closes immediately.
 ```
 
 ### Parallel Probe (Fail-Fast, Sequential Reader Only)
@@ -491,6 +516,8 @@ on each miss of readSeq:
 ```
 
 On `gapDetected` and `time.Since(lastSuccessfulRead) > stallTimeout` -> close session -> reconnect.
+
+`stallTimeout=5s` is intentionally aggressive for Sequential Reader (Strong Consistency backends). A gap on a strong-consistency backend means the file is genuinely lost, not just delayed - jitter is 30ms so a 5s window is more than sufficient. Probe is **not used in OOO Reader**: eventual consistency backends (GDrive) handle delays via `ooTimeout=120s`, and the 8-slot lookahead window already covers out-of-order arrival. Adding probe to OOO Reader would produce false positives on backends where multi-second list delays are normal.
 
 ### Read() (leftover buffer management)
 
@@ -548,10 +575,14 @@ loop:
 2. quantized_min = strconv.FormatInt(time.Now().Unix()/60*60, 10)
 3. hmac16 = lowercase_hex(HMAC-SHA256(sharedSecret, quantized_min)[:8])
 4. Create session folder (for WebDAV / GDrive)
-5. firstData = wrapWithHMAC(firstChunk)
+5. firstData = wrapWithHMAC(firstChunk)   // this IS c2s/0
 6. discoveryPayload = sessionID_bytes(36) + firstData
 7. Upload(_new/{quantized_min}_{hmac16}, discoveryPayload)
    // If Upload fails - restart with a new sessionID
+8. writeSeq = 1
+   // c2s/0 was delivered via discovery file, not as a separate storage object.
+   // Writer must start at seq=1. Starting at 0 would either duplicate c2s/0 in
+   // storage or collide with the server's injectFirstPacket on readSeq=0.
 ```
 
 ### Discovery Loop + Admission Control
@@ -593,6 +624,12 @@ every 500ms:
 
         // Step 4: payload extraction
         if len(file.Data) < 36 + 2:
+            // Payload is too short to contain a valid sessionID + wire format header.
+            // On eventual-consistency backends (GDrive) ListNew may return a file
+            // before it is fully written - this is a partial read at the discovery layer.
+            // There is no retry here: enqueue for deletion and skip. The client will
+            // not receive s2c/0 within deadTimeout=30s and will restart with a new sessionID.
+            // This is correct behavior: a lost discovery file is cheaper than a stuck session.
             enqueueDelete(file)
             continue
 
@@ -607,7 +644,10 @@ every 500ms:
 
         conn ← newXdriveConnection(sessionID, isServer=true)
         conn.sessionClosed = false
-        conn.injectFirstPacket(firstPacket)   // includes wire format validation
+        conn.injectFirstPacket(firstPacket)
+        // injectFirstPacket sends the first packet into readCh and sets readSeq=1.
+        // Without this, the Reader would attempt Download(c2s/0) which will never
+        // appear in storage - it was consumed from the discovery file payload.
         sessions.Store(sessionID, sessionEntry{conn, time.Now()})
         addConn(conn)
         enqueueDelete(file)
@@ -659,6 +699,23 @@ A session is closed when:
 - `ErrWriteBufferFull` is returned from Write()
 
 **Two-phase close.** Side A sends FIN -> side B receives FIN, sends its own FIN -> A receives FIN -> both call CleanupSession. If the acknowledgment FIN is not received within `finAckTimeout` (15s), CleanupSession is called unilaterally.
+
+The signal path from Reader to Writer is explicit via `conn.remoteFinCh chan struct{}`:
+
+```
+Reader receives remote FIN:
+    close(conn.remoteFinCh)   // signal Writer to drain and send own FIN
+    initiate graceful close (wait for own FIN to be sent)
+
+Writer loop - additional select arm:
+    case <-conn.remoteFinCh:
+        // flush any remaining writeBuf, then send FIN
+        drain writeBuf -> Upload inflight if non-empty
+        send FIN
+        return
+```
+
+Without this signal, the Writer may not drain `writeBuf` before the session context is cancelled, causing data loss on the last flush.
 
 ```go
 ctx := context.WithTimeout(context.Background(), 15*time.Second)
@@ -815,7 +872,9 @@ readerRng = rand.New(rand.NewSource(
     "maxNewSessionsPerMinute": 60,
 
     "periodicGCInterval":      "5m",
-    "gcMaxAge":                "1h"
+    "gcMaxAge":                "1h",
+
+    "minProbeHits":            3
   }
 }
 ```
@@ -826,12 +885,12 @@ For Google Drive, `ooTimeout` should be set to `"120s"` due to eventual consiste
 
 ## Backend Priority
 
-| Backend       | Write        | List         | BatchDelete       | Notes                   |
-|---------------|--------------|--------------|-------------------|-------------------------|
-| Local FS      | Strong       | Strong       | none              | Development and testing |
-| S3-compatible | Strong       | Strong*      | 1000 (non-atomic) | Self-hosted, corporate  |
-| OneDrive      | Strong**     | Undocumented | 20 (JSON batch)   | Western audience        |
-| Google Drive  | Strong by ID | Eventual     | 100               | Last fallback           |
+| Backend       | Write        | List         | BatchDelete          | Notes                   |
+|---------------|--------------|--------------|----------------------|-------------------------|
+| Local FS      | Strong       | Strong       | sequential os.Remove | Development and testing |
+| S3-compatible | Strong       | Strong*      | 1000 (non-atomic)    | Self-hosted, corporate  |
+| OneDrive      | Strong**     | Undocumented | 20 (JSON batch)      | Western audience        |
+| Google Drive  | Strong by ID | Eventual     | 100                  | Last fallback           |
 
 `*` **S3 LIST** - each individual request is immediately consistent, but multi-page pagination is not an atomic snapshot. CleanupSession: repeat ListPrefix until count == 0, maximum 5 iterations.
 
@@ -839,7 +898,7 @@ For Google Drive, `ooTimeout` should be set to `"120s"` due to eventual consiste
 
 `**` **OneDrive** - direct `GET /items/{id}/content` is expected to be immediately consistent after `PUT`, but Microsoft does not document this. Empirical verification required before production use.
 
-**Google Drive** - `files.get(fileId)` is immediately consistent; `files.list()` is eventual (2-30s, up to one hour in shared drives). Limits: 20,000 requests/100s, ~300 writes/100s (write limit cannot be increased). At `targetRPS=2`, suitable for at most 1 concurrent session.
+**Google Drive** - `files.get(fileId)` is immediately consistent; `files.list()` is eventual (2-30s, up to one hour in shared drives). Limits: 20,000 requests/100s, ~300 writes/100s **per GCP project** (write limit cannot be increased). If multiple XDRIVE server instances share one GCP project/OAuth client, the write quota is shared across all of them. At `targetRPS=2`, one session generates 2 client uploads/s + 2 server uploads/s = 4 writes/s total, which already exceeds the 3 writes/s project limit. **`targetRPS` for GDrive must be set to `1` maximum**, giving 1+1=2 writes/s across both sides. Suitable for at most 1 concurrent session per GCP project.
 
 -----
 
@@ -872,7 +931,7 @@ readerRng    = rand.New(rand.NewSource(
 
 ### §3 - Clock Skew in Discovery
 
-The authoritative freshness source is `ServerTime` (cloud Last-Modified). The client timestamp in the filename is quantized to the minute and serves only as a secondary hint. Zombie: `ServerTime < now-2m`. Clock skew: client timestamp old but server timestamp fresh - accept with WARNING.
+The authoritative freshness source is `ServerTime` (cloud Last-Modified). The client timestamp in the filename is quantized to the minute and serves only as a secondary hint. Zombie: `ServerTime < now-2m`. Clock skew: client timestamp old but server timestamp fresh - accept and log via `newError("XDRIVE discovery: clock skew on session ", sessionID).AtWarning().WriteToLog()` (Xray logging convention).
 
 ### §4 - Per-Connection Read Buffer
 
@@ -911,6 +970,21 @@ return data[2 : 2+payloadLen], nil
 ### §7 - Probe: Gap vs Stall
 
 Probe checks `readSeq+1` and signals `gapDetected` only if `readSeq+1` already exists while `readSeq` does not. This is a gap (lost file), not a stall (Writer has not yet written seq+1). Under low traffic, the probe consistently returns ErrNotExist - this is normal and does not indicate a problem.
+
+To prevent a single spurious probe hit from triggering reconnect during burst traffic, `gapDetected` is only raised after `minProbeHits` consecutive successful probes (default 1):
+
+```go
+if err != ErrNotExist {
+    consecutiveProbeHits++
+    if consecutiveProbeHits >= minProbeHits {
+        signal gapDetected
+    }
+} else {
+    consecutiveProbeHits = 0
+}
+```
+
+`minProbeHits=1` is correct for strong-consistency backends. Writer is a single goroutine with one inflight at a time - `seq=N` is always confirmed before `seq=N+1` is uploaded. There is no valid scenario where `seq=N+1` exists in storage while `seq=N` is merely delayed: if `N+1` is visible and `N` is not, `N` is genuinely lost. Higher values only delay gap detection by `minProbeHits x pollMin` without adding correctness.
 
 ### §8 - Google Drive: Hybrid Download
 
@@ -965,16 +1039,16 @@ Per-session:
   writeBuf         = maxWriteBufSize        =  8 MB
   inflight         = maxChunkSize           =  4 MB
   readBuf          = maxChunkSize + 18      =  4 MB
-  readCh (depth 2) = maxChunkSize x 2      =  8 MB
-  total per session                        ~ 24 MB
+  readCh (depth 1) = maxChunkSize x 1      =  4 MB
+  total per session                        ~ 20 MB
 
-Server total ~ maxConcurrentSessions x 24 MB + overhead
+Server total ~ maxConcurrentSessions x 20 MB + overhead
 
 Examples:
-  10  sessions ->   ~240 MB
-  50  sessions ->  ~1.2 GB
-  100 sessions ->  ~2.4 GB
-  500 sessions -> ~12.0 GB
+  10  sessions ->   ~200 MB
+  50  sessions ->  ~1.0 GB
+  100 sessions ->  ~2.0 GB
+  500 sessions -> ~10.0 GB
 ```
 
 `maxConcurrentSessions` constrains both backend rate limits and memory consumption.
